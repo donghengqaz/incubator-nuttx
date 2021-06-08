@@ -728,6 +728,29 @@ choice EXAMPLE_POWER_SAVE_MODE
 		bool "maximum modem"
 endchoice
 
+config ESP32C3_LOAD_PHY_INIT_DATA_IN_SPI_FLASH
+	bool "Load PHY init data in SPI Flash"
+	depends on ESP32C3_SPIFLASH
+	default n
+
+config ESP32C3_LOAD_PHY_INIT_DATA_ADDR
+	hex "PHY init data address in SPI Flash"
+	default 0x170000
+	depends on ESP32C3_LOAD_PHY_INIT_DATA_IN_SPI_FLASH
+	---help---
+		The PHY init data should be written into
+		this address of SPI Flash before running code. 
+
+config ESP32C3_SUPPORT_MULTIPLE_PHY_INIT_DATA
+	bool "Support multiple PHY init data"
+	default n
+	depends on ESP32C3_LOAD_PHY_INIT_DATA_IN_SPI_FLASH
+
+config ESP32C3_SUPPORT_ENCRYPTED_PHY_INIT_DATA
+	bool "Support encrypted PHY init data by Flash Encryption"
+	default n
+	depends on ESP32C3_LOAD_PHY_INIT_DATA_IN_SPI_FLASH
+
 endmenu # ESP32C3_WIRELESS
 
 menu "SPI Flash configuration"

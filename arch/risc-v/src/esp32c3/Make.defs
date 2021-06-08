@@ -164,10 +164,6 @@ chip/$(WIRELESS_DRV_UNPACK): $(WIRELESS_DRV_ZIP)
 
 context:: chip/$(WIRELESS_DRV_UNPACK)
 
-clean_context::
-	$(call DELFILE, chip/$(WIRELESS_DRV_ZIP))
-	$(call DELDIR, chip/$(WIRELESS_DRV_UNPACK))
-
 INCLUDES += $(shell $(INCDIR) "$(CC)" $(ARCH_SRCDIR)$(DELIM)chip$(DELIM)esp-wireless-drivers-3rdparty$(DELIM)include)
 INCLUDES += $(shell $(INCDIR) "$(CC)" $(ARCH_SRCDIR)$(DELIM)chip$(DELIM)esp-wireless-drivers-3rdparty$(DELIM)include$(DELIM)esp32c3)
 CHIP_CSRCS += esp32c3_wlan.c esp32c3_wifi_utils.c esp32c3_wifi_adapter.c

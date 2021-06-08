@@ -59,11 +59,16 @@
 #include "esp32c3_rt_timer.h"
 #include "esp32c3_wifi_utils.h"
 
+#ifdef CONFIG_ESP32C3_LOAD_PHY_INIT_DATA_IN_SPI_FLASH
+#  include "esp32c3_spiflash.h"
+#endif
+
 #ifdef CONFIG_PM
 #include "esp32c3_pm.h"
 #endif
 
 #include "espidf_wifi.h"
+
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -368,6 +373,7 @@ void esp_fill_random(void *buf, size_t len);
 void esp_log_write(uint32_t level, const char *tag, const char *format, ...);
 uint32_t esp_log_timestamp(void);
 uint8_t esp_crc8(const uint8_t *p, uint32_t len);
+uint32_t crc32_le(uint32_t crc, uint8_t const *buf, uint32_t len);
 
 /****************************************************************************
  * Private Data
@@ -2423,6 +2429,87 @@ static void wifi_phy_disable(void)
   leave_critical_section(flags);
 }
 
+#ifdef CONFIG_ESP32C3_LOAD_PHY_INIT_DATA_IN_SPI_FLASH
+static esp_phy_init_data_t *wifi_get_phy_init_data(void)
+{
+  ssize_t ret;
+  uint8_t *buffer;
+  struct mtd_dev_s *mtd_dev;
+  const uint32_t addr = CONFIG_ESP32C3_LOAD_PHY_INIT_DATA_ADDR;
+  const int size = sizeof(phy_init_magic_pre) +
+                   sizeof(esp_phy_init_data_t) +
+                   sizeof(phy_init_magic_post);
+
+  wlinfo("INFO: Loading PHY init data %d bytes in 0x%08lx\n", size, addr);
+
+  buffer = kmm_malloc(size);
+  if (!buffer)
+    {
+      wlerr("ERROR: Failed to allocate %d bytes\n", size);
+      return NULL;
+    }
+
+#ifdef CONFIG_ESP32C3_SUPPORT_ENCRYPTED_PHY_INIT_DATA
+  mtd_dev = esp32c3_spiflash_encrypt_mtd();
+#else
+  mtd_dev = esp32c3_spiflash_mtd();
+#endif
+
+  ret = MTD_READ(mtd_dev, addr, size, buffer);
+  if (ret <= 0)
+    {
+      wlerr("ERROR: Failed to read %d bytes in 0x%08lx ret=%d\n",
+            size, addr, ret);
+      goto errout_read_data;
+    }
+
+  if (memcmp(buffer, phy_init_magic_pre, sizeof(phy_init_magic_pre)) != 0 ||
+      memcmp(buffer + size - sizeof(phy_init_magic_post),
+             phy_init_magic_post,
+             sizeof(phy_init_magic_post)) != 0)
+    {
+      wlerr("ERROR: Failed to check PHY init data\n");
+      goto errout_read_data;
+    }
+
+#ifdef CONFIG_ESP32C3_SUPPORT_MULTIPLE_PHY_INIT_DATA
+  if (buffer[sizeof(phy_init_magic_pre) + PHY_SUPPORT_MULTIPLE_BIN_OFFSET])
+    {
+      wlinfo("INFO: Support multiple PHY init data bin\n");
+    }
+  else
+    {
+      wlerr("ERROR: Does not support multiple PHY init data bin\n");
+      goto errout_read_data;
+    }
+#endif
+
+  wlinfo("INFO: PHY init data validated\n");
+
+  return (esp_phy_init_data_t *)(buffer + sizeof(phy_init_magic_pre));
+
+errout_read_data:
+  kmm_free(buffer);
+  return NULL;
+}
+
+static void wifi_free_phy_init_data(esp_phy_init_data_t *data)
+{
+  kmm_free((uint8_t *)data - sizeof(phy_init_magic_pre));
+}
+#else
+static esp_phy_init_data_t *wifi_get_phy_init_data(void)
+{
+  wlinfo("Loading PHY init data from application binary\n");
+
+  return (esp_phy_init_data_t *)&phy_init_data;
+}
+
+static void wifi_free_phy_init_data(esp_phy_init_data_t *data)
+{
+}
+#endif
+
 /****************************************************************************
  * Name: wifi_phy_enable
  *
@@ -2441,11 +2528,20 @@ static void wifi_phy_enable(void)
 {
   irqstate_t flags;
   esp_phy_calibration_data_t *cal_data;
+  esp_phy_init_data_t *init_data;
+
+  init_data = wifi_get_phy_init_data();
+  if (!init_data)
+    {
+      wlerr("ERROR: Failed to get PHY init data\n");
+      DEBUGASSERT(0);
+    }
 
   cal_data = kmm_zalloc(sizeof(esp_phy_calibration_data_t));
   if (!cal_data)
     {
-      wlerr("ERROR: Failed to kmm_zalloc");
+      wlerr("ERROR: Failed to kmm_zalloc\n");
+      wifi_free_phy_init_data(init_data);
       DEBUGASSERT(0);
     }
 
@@ -2459,12 +2555,13 @@ static void wifi_phy_enable(void)
 
       esp_phy_enable_clock();
       phy_set_wifi_mode_only(0);
-      register_chipv7_phy(&phy_init_data, cal_data, PHY_RF_CAL_NONE);
+      register_chipv7_phy(init_data, cal_data, PHY_RF_CAL_NONE);
     }
 
   g_phy_access_ref++;
   leave_critical_section(flags);
   kmm_free(cal_data);
+  wifi_free_phy_init_data(init_data);
 }
 
 /****************************************************************************
@@ -2540,9 +2637,215 @@ void esp_phy_disable_clock(void)
  *
  ****************************************************************************/
 
+#ifdef CONFIG_ESP32C3_SUPPORT_MULTIPLE_PHY_INIT_DATA
+static char g_phy_current_country[PHY_COUNTRY_CODE_LEN];
+
+
+/* Country and PHY init data type map */
+static const phy_country_to_bin_type_t g_country_code_map_type_table[] =
+{
+  {"AT",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"AU",  ESP_PHY_INIT_DATA_TYPE_ACMA},
+  {"BE",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"BG",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"BR",  ESP_PHY_INIT_DATA_TYPE_ANATEL},
+  {"CA",  ESP_PHY_INIT_DATA_TYPE_ISED},
+  {"CH",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"CN",  ESP_PHY_INIT_DATA_TYPE_SRRC},
+  {"CY",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"CZ",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"DE",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"DK",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"EE",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"ES",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"FI",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"FR",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"GB",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"GR",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"HK",  ESP_PHY_INIT_DATA_TYPE_OFCA},
+  {"HR",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"HU",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"IE",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"IN",  ESP_PHY_INIT_DATA_TYPE_WPC},
+  {"IS",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"IT",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"JP",  ESP_PHY_INIT_DATA_TYPE_MIC},
+  {"KR",  ESP_PHY_INIT_DATA_TYPE_KCC},
+  {"LI",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"LT",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"LU",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"LV",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"MT",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"MX",  ESP_PHY_INIT_DATA_TYPE_IFETEL},
+  {"NL",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"NO",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"NZ",  ESP_PHY_INIT_DATA_TYPE_RCM},
+  {"PL",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"PT",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"RO",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"SE",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"SI",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"SK",  ESP_PHY_INIT_DATA_TYPE_CE},
+  {"TW",  ESP_PHY_INIT_DATA_TYPE_NCC},
+  {"US",  ESP_PHY_INIT_DATA_TYPE_FCC},
+};
+
+static const char *g_phy_type[ESP_PHY_INIT_DATA_TYPE_NUMBER] =
+{
+  "DEFAULT", "SRRC", "FCC", "CE", "NCC", "KCC", "MIC", "IC",
+  "ACMA", "ANATEL", "ISED", "WPC", "OFCA", "IFETEL", "RCM"
+};
+#endif
+
 static int wifi_phy_update_country_info(const char *country)
 {
+#ifdef CONFIG_ESP32C3_SUPPORT_MULTIPLE_PHY_INIT_DATA
+  int i;
+  int size;
+  int offset;
+  int ret;
+  uint32_t crc32;
+  struct mtd_dev_s *mtd_dev;
+  phy_init_data_type_t type;
+  esp_phy_init_data_t *init_datas;
+  phy_control_info_data_t *ctrl_data;
+  const uint32_t addr = CONFIG_ESP32C3_LOAD_PHY_INIT_DATA_ADDR;
+
+  wlinfo("INFO: country=%c%c\n", country[0], country[1]);
+
+  if (!memcmp(country, g_phy_current_country, PHY_COUNTRY_CODE_LEN))
+    {
+      return 0;
+    }
+
+  memcpy(g_phy_current_country, country, PHY_COUNTRY_CODE_LEN);
+
+  size = sizeof(g_country_code_map_type_table) /
+         sizeof(g_country_code_map_type_table[0]);
+  for (i = 0; i < size; i++)
+    {
+      if (!memcmp(country, g_country_code_map_type_table[i].cc,
+                  PHY_COUNTRY_CODE_LEN))
+        {
+          type = g_country_code_map_type_table[i].type;
+          wlinfo("INFO: Current country is %c%c type is %s\n",
+                 country[0], country[1], g_phy_type[type]);
+          break;
+        }
+    }
+
+  if (i >= size)
+    {
+      wlerr("ERROR: Failed to find country map\n");
+      return -EINVAL;
+    }
+
+  wlinfo("INFO: PHY type=%d\n", type);
+  
+  size = sizeof(phy_control_info_data_t);
+  ctrl_data = kmm_malloc(size);
+  if (!ctrl_data)
+    {
+      wlerr("ERROR: Failed to allocate %d bytes\n", size);
+      return -ENOMEM;
+    }
+
+#ifdef CONFIG_ESP32C3_SUPPORT_ENCRYPTED_PHY_INIT_DATA
+  mtd_dev = esp32c3_spiflash_encrypt_mtd();
+#else
+  mtd_dev = esp32c3_spiflash_mtd();
+#endif
+
+  offset = addr + sizeof(phy_init_magic_pre) +
+                  sizeof(esp_phy_init_data_t) +
+                  sizeof(phy_init_magic_post);
+  ret = MTD_READ(mtd_dev, offset, size, (uint8_t *)ctrl_data);
+  if (ret <= 0)
+    {
+      wlerr("ERROR: Failed to read %d bytes in 0x%08lx ret=%d\n",
+            size, offset, ret);
+      goto errout_read_ctrl_data;
+    }
+
+  if (ctrl_data->check_algorithm != PHY_CRC_ALGORITHM)
+    {
+      wlerr("ERROR: check_algorithm=%d is invalid\n",
+            ctrl_data->check_algorithm);
+      goto errout_read_ctrl_data;
+    }
+
+  size = sizeof(phy_control_info_data_t) -
+         sizeof(ctrl_data->control_info_checksum);
+  crc32 = crc32_le(0, ctrl_data->multiple_bin_checksum, size);
+  crc32 = htonl(crc32);
+  if (memcmp(&crc32, ctrl_data->control_info_checksum, 4))
+    {
+      wlerr("ERROR: Failed to check info crc32=0x%08lx is invalid\n", crc32);
+      goto errout_read_ctrl_data;
+    }
+
+  size = sizeof(esp_phy_init_data_t) * ctrl_data->number;
+  init_datas = kmm_malloc(size);
+  if (!init_datas)
+    {
+      wlerr("ERROR: Failed to allocate %d bytes\n", size);
+      goto errout_read_ctrl_data;
+    }
+
+  offset = addr + sizeof(phy_init_magic_pre) +
+                  sizeof(esp_phy_init_data_t) +
+                  sizeof(phy_init_magic_post) +
+                  sizeof(phy_control_info_data_t);
+  ret = MTD_READ(mtd_dev, offset, size, (uint8_t *)init_datas);
+  if (ret <= 0)
+    {
+      wlerr("ERROR: Failed to read %d bytes in 0x%08lx ret=%d\n",
+            size, offset, ret);
+      goto errout_read_init_data;
+    }
+
+  crc32 = crc32_le(0, (uint8_t *)init_datas, size);
+  crc32 = htonl(crc32);
+  if (memcmp(&crc32, ctrl_data->multiple_bin_checksum, 4))
+    {
+      wlerr("ERROR: Failed to check bin crc32=0x%08lx is invalid\n", crc32);
+      goto errout_read_init_data;
+    }
+
+  for (i = 0; i < ctrl_data->number; i++)
+    {
+      if (type == init_datas[i].params[PHY_INIT_DATA_TYPE_OFFSET])
+        {
+          break;
+        }
+    }
+  
+  if (i >= ctrl_data->number)
+    {
+      wlerr("ERROR: Failed to find PHY init data\n");
+      goto errout_read_init_data;
+    }
+
+  ret = esp_phy_apply_phy_init_data(init_datas[i].params);
+  if (ret)
+    {
+      wlerr("ERROR: Failed to apply PHY init data ret=%d\n", ret);
+      goto errout_read_init_data;
+    }
+
+  kmm_free(init_datas);
+  kmm_free(ctrl_data);
+
+  return 0;
+
+errout_read_init_data:
+  kmm_free(init_datas);
+errout_read_ctrl_data:
+  kmm_free(ctrl_data);
   return -1;
+#else
+  return 0;
+#endif
 }
 
 /****************************************************************************
